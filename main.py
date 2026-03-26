@@ -233,7 +233,15 @@ async def stream_logs(job_id: str):
                 break
             await asyncio.sleep(1)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
 
 @app.get("/api/job/{job_id}/download/{file_type}")
 async def download_file(job_id: str, file_type: str):
