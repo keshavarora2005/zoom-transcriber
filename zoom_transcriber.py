@@ -221,6 +221,7 @@ STATES = {
     "name_input":     "input#inputname, input[placeholder*='Your Name' i], input[placeholder*='name' i], input[placeholder*='Enter your name' i], input[type='text']",
     "passcode_input": "input#inputpasscode, input[placeholder*='passcode' i], input[placeholder*='password' i]",
     "waiting_room":   "[class*='waitingRoom'], [class*='waiting-room'], div:has-text('Waiting for host')",
+    "joining":        "div:has-text('Joining Meeting'), [class*='join-meeting'], div:has-text('Joining')",
     "audio_dialog":   "[class*='join-audio-by-voip'], button:has-text('Join with Computer Audio'), button:has-text('Join Audio'), button:has-text('Test Speaker')",
     "in_meeting":     "#wc-footer, [class*='footer-container'], [class*='meeting-app'], div[role='main']",
     "meeting_ended":  "[class*='meeting-ended'], div:has-text('meeting has been ended by the host'), div:has-text('This meeting has been ended')",
@@ -664,12 +665,13 @@ async def run_bot(
                         except Exception:
                             pass
 
-                    # 4c: scan ALL elements whose text contains "join"
+                    # 4c: scan ALL elements whose text contains "join" (but exclude "joining")
                     try:
                         candidates = await page.query_selector_all("button, [role='button'], div, span, a")
                         for el in candidates:
                             txt = (await el.text_content() or "").strip().lower()
-                            if txt in ("join", "join meeting", "join now"):
+                            # Only click actual join buttons, not status indicators
+                            if txt in ("join", "join meeting", "join now") and "joining" not in txt:
                                 await el.click()
                                 log.info(f"  Join clicked via text scan: {txt!r}")
                                 return True
@@ -693,6 +695,15 @@ async def run_bot(
                     log.warning("  Still on name_input — second join attempt...")
                     await try_click_join()
                     await asyncio.sleep(5)
+                elif recheck == "joining":
+                    log.info("  Joining in progress — waiting for transition...")
+                    # Wait for joining to complete (can take 10-15 seconds)
+                    join_result = await wait_state(page, ["audio_dialog", "in_meeting", "waiting_room"], 20, debug_dir=debug_dir, tag="joining")
+                    log.info(f"  Join result: {join_result!r}")
+                    if join_result in ["timeout", "error"]:
+                        log.warning("  Joining timed out - trying manual refresh...")
+                        await page.reload(wait_until="domcontentloaded")
+                        await asyncio.sleep(3)
 
             else:
                 log.warning(f"Name field not shown ({ns}) — trying fallback...")
