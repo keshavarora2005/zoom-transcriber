@@ -575,8 +575,9 @@ async def run_bot(
                     el = await page.query_selector(sel)
                     if el:
                         await el.click()
-                        await el.triple_click()           # select all existing text
-                        await el.fill("")                 # clear field explicitly
+                        # Select all existing text and clear it (ElementHandle compatible)
+                        await el.press("Control+a")
+                        await el.press("Backspace")
                         await asyncio.sleep(0.3)
                         await el.type(display_name, delay=80)
                         log.info(f"  Name entered ({sel})")
@@ -632,8 +633,8 @@ async def run_bot(
                         ph = await inp.get_attribute("placeholder") or ""
                         if "name" in ph.lower() or "enter" in ph.lower() or not ph:
                             await inp.click()
-                            await inp.triple_click()
-                            await inp.fill("")
+                            await inp.press("Control+a")
+                            await inp.press("Backspace")
                             await asyncio.sleep(0.3)
                             await inp.type(display_name, delay=80)
                             log.info(f"  Name entered via fallback")
