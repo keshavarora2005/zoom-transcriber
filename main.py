@@ -1,19 +1,13 @@
 """
 main.py - FastAPI Web Interface for Zoom Meeting Transcriber
-
-Run with:
-    python main.py
 """
 
-# ── asyncio fix — must be first ───────────────────────────────────────────────
 import sys
 import asyncio
 
-# Only apply Windows fix on Windows — Render runs Linux
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# ── Rest of imports ───────────────────────────────────────────────────────────
 import datetime
 import json
 import logging
@@ -47,17 +41,43 @@ log = logging.getLogger("web_interface")
 
 app = FastAPI(title="Zoom Meeting Transcriber", version="1.0.0")
 
-# ── Static files & templates — create dirs if missing (safety net) ────────────
 Path("static").mkdir(exist_ok=True)
 Path("templates").mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# ── Use /app/recordings on Render (persistent disk), fallback to local ────────
+# ── Persistent storage on the Render disk ─────────────────────────────────────
 RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "./recordings"))
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_FILE = RECORDINGS_DIR / "jobs.json"   # survives container restarts
 
-jobs: dict = {}
+# ── Job state — loaded from disk on startup ───────────────────────────────────
+def _load_jobs() -> dict:
+    try:
+        if JOBS_FILE.exists():
+            data = json.loads(JOBS_FILE.read_text())
+            # Mark any job that was mid-flight as failed (process was killed)
+            for job in data.values():
+                if job.get("status") in ("starting", "recording", "stopping", "transcribing"):
+                    job["status"] = "failed"
+                    job.setdefault("logs", []).append(
+                        "❌ Server was restarted while this job was running."
+                    )
+            return data
+    except Exception as e:
+        log.warning(f"Could not load jobs file: {e}")
+    return {}
+
+def _save_jobs():
+    try:
+        JOBS_FILE.write_text(json.dumps(jobs, indent=2))
+    except Exception as e:
+        log.warning(f"Could not save jobs file: {e}")
+
+jobs: dict = _load_jobs()
+
+# ── Active asyncio tasks — so we can cancel them on stop ─────────────────────
+active_tasks: dict = {}   # job_id -> asyncio.Task
 
 class StartRequest(BaseModel):
     zoom_link: str
@@ -68,11 +88,11 @@ class StartRequest(BaseModel):
 
 async def run_job(job_id: str, req: StartRequest):
     job = jobs[job_id]
-    job["logs"] = []
 
     def log_job(msg: str):
         log.info(f"[{job_id[:8]}] {msg}")
         jobs[job_id].setdefault("logs", []).append(msg)
+        _save_jobs()   # persist every log line
 
     try:
         log_job("🔗 Parsing Zoom link...")
@@ -86,9 +106,10 @@ async def run_job(job_id: str, req: StartRequest):
         webm_path = out_dir / f"zoom_{meeting_id}_{ts}.webm"
         job["webm_path"] = str(webm_path)
         job["out_dir"] = str(out_dir)
+        _save_jobs()
 
         if not req.skip_transcript and not os.getenv("API_KEY"):
-            raise RuntimeError("API_KEY not found in environment. Set it in the Render dashboard under Environment Variables.")
+            raise RuntimeError("API_KEY not found. Set it in the Render dashboard under Environment Variables.")
 
         writer = ChunkWriter(webm_path)
         job["status"] = "recording"
@@ -115,6 +136,7 @@ async def run_job(job_id: str, req: StartRequest):
             raise RuntimeError("Recording file is missing or too small. No audio was captured.")
 
         job["webm_size_mb"] = round(webm.stat().st_size / 1_048_576, 2)
+        _save_jobs()
 
         if not req.skip_transcript:
             job["status"] = "transcribing"
@@ -128,10 +150,26 @@ async def run_job(job_id: str, req: StartRequest):
             job["status"] = "done"
             log_job("🎉 Recording completed (transcript skipped)")
 
+    except asyncio.CancelledError:
+        # Task was cancelled (e.g. server shutdown) — save state cleanly
+        job["status"] = "failed"
+        job.setdefault("logs", []).append("❌ Job was cancelled (server restart or shutdown).")
+        _save_jobs()
+        raise
+
     except Exception as e:
         log.error(f"Job {job_id} failed: {e}", exc_info=True)
         job["status"] = "failed"
         job.setdefault("logs", []).append(f"❌ Error: {e}")
+        _save_jobs()
+
+    finally:
+        active_tasks.pop(job_id, None)
+
+# ── Startup: clean up any stale in-progress jobs from a previous process ──────
+@app.on_event("startup")
+async def startup_event():
+    log.info(f"Loaded {len(jobs)} job(s) from disk.")
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -148,7 +186,11 @@ async def start_job(req: StartRequest, background_tasks: BackgroundTasks):
         "created_at": datetime.datetime.now().isoformat(),
         "logs": [],
     }
-    background_tasks.add_task(run_job, job_id, req)
+    _save_jobs()
+
+    # Use a real Task so we can cancel it on stop
+    task = asyncio.create_task(run_job(job_id, req))
+    active_tasks[job_id] = task
     return {"job_id": job_id, "status": "starting"}
 
 @app.get("/api/job/{job_id}")
@@ -197,17 +239,27 @@ async def stop_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
     job = jobs[job_id]
-    if job.get("status") != "recording":
-        raise HTTPException(400, "Job is not currently recording")
+    if job.get("status") not in ("recording", "starting", "stopping"):
+        raise HTTPException(400, f"Job is not currently recording (status: {job.get('status')})")
+
+    # Signal the bot loop to stop gracefully
     job["manual_stop"] = True
     job["status"] = "stopping"
+    _save_jobs()
+
+    log.info(f"Stop requested for job {job_id[:8]}")
     return {"message": "Stop request sent", "job_id": job_id}
 
 @app.delete("/api/job/{job_id}")
 async def delete_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
+    # Cancel task if still running
+    task = active_tasks.pop(job_id, None)
+    if task and not task.done():
+        task.cancel()
     job = jobs.pop(job_id)
+    _save_jobs()
     out_dir = Path(job.get("out_dir", ""))
     if out_dir.exists():
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -224,5 +276,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
         reload=False,
-        # Do NOT set loop="none" on Linux — let uvicorn pick the default
     )
