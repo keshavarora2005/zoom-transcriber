@@ -1,0 +1,11 @@
+venv/
+.env
+recordings/
+__pycache__/
+*.pyc
+*.pyo
+.env.local
+*.webm
+*.mp3
+*.wav
+*.pdf

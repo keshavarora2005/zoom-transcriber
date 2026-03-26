@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ZoomScribe — Meeting Transcriber</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <!-- Background grid -->
+  <div class="bg-grid"></div>
+  <div class="bg-glow"></div>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="logo">
+      <div class="logo-icon">
+        <div class="waveform-icon">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+      <div class="logo-text">
+        <span class="logo-name">ZoomScribe</span>
+        <span class="logo-tag">Meeting Transcriber</span>
+      </div>
+    </div>
+    <div class="header-status" id="headerStatus">
+      <span class="dot idle"></span>
+      <span class="status-text">Ready</span>
+    </div>
+  </header>
+
+  <!-- Main -->
+  <main class="main">
+
+    <!-- Hero section -->
+    <section class="hero">
+      <div class="hero-label">AUTOMATED TRANSCRIPTION</div>
+      <h1 class="hero-title">Record.<br>Transcribe.<br>Archive.</h1>
+      <p class="hero-sub">Paste a Zoom link. We join, record, and deliver a speaker-labeled PDF transcript — automatically.</p>
+    </section>
+
+    <!-- Form card -->
+    <section class="form-section" id="formSection">
+      <div class="card form-card">
+        <div class="card-header">
+          <span class="card-label">NEW SESSION</span>
+          <div class="card-indicator"></div>
+        </div>
+
+        <div class="form-body">
+          <div class="field">
+            <label class="field-label" for="zoomLink">
+              <span class="label-num">01</span> Zoom Meeting Link
+            </label>
+            <div class="input-wrap">
+              <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15.75 10.5l4.72-4.72a.75.75 0 011.28.53v11.38a.75.75 0 01-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 002.25-2.25v-9a2.25 2.25 0 00-2.25-2.25h-9A2.25 2.25 0 002.25 7.5v9a2.25 2.25 0 002.25 2.25z"/></svg>
+              <input type="text" id="zoomLink" class="input" placeholder="https://us04web.zoom.us/j/XXXX?pwd=YYY" autocomplete="off" />
+            </div>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label class="field-label" for="displayName">
+                <span class="label-num">02</span> Bot Display Name
+              </label>
+              <div class="input-wrap">
+                <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" /></svg>
+                <input type="text" id="displayName" class="input" placeholder="Recorder" value="Recorder" />
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="field-label" for="maxMinutes">
+                <span class="label-num">03</span> Max Duration (min)
+              </label>
+              <div class="input-wrap">
+                <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6l4 2"/></svg>
+                <input type="number" id="maxMinutes" class="input" placeholder="180" value="180" min="1" max="480" />
+              </div>
+            </div>
+          </div>
+
+          <div class="toggles-row">
+          </div>
+
+          <button class="btn-start" id="btnStart" onclick="startJob()">
+            <span class="btn-text">Start Recording Session</span>
+            <div class="btn-arrow">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3"/></svg>
+            </div>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Active job panel -->
+    <section class="job-section hidden" id="jobSection">
+      <div class="card job-card">
+        <div class="card-header">
+          <span class="card-label" id="jobLabel">RECORDING</span>
+          <div class="job-meta">
+            <span id="jobMeetingId" class="job-id-badge"></span>
+            <button class="btn-icon" onclick="cancelView()" title="Close">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Status bar -->
+        <div class="status-bar">
+          <div class="status-steps">
+            <div class="step" id="step-joining">
+              <div class="step-dot"></div>
+              <span>Joining</span>
+            </div>
+            <div class="step-line"></div>
+            <div class="step" id="step-recording">
+              <div class="step-dot"></div>
+              <span>Recording</span>
+            </div>
+            <div class="step-line"></div>
+            <div class="step" id="step-transcribing">
+              <div class="step-dot"></div>
+              <span>Transcribing</span>
+            </div>
+            <div class="step-line"></div>
+            <div class="step" id="step-done">
+              <div class="step-dot"></div>
+              <span>Done</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Live waveform -->
+        <div class="waveform-container" id="waveformContainer">
+          <div class="waveform-label">LIVE AUDIO ACTIVITY</div>
+          <div class="waveform" id="waveform">
+            <div class="wave-bars" id="waveBars"></div>
+          </div>
+        </div>
+
+        <!-- Log terminal -->
+        <div class="terminal">
+          <div class="terminal-header">
+            <div class="terminal-dots">
+              <span></span><span></span><span></span>
+            </div>
+            <span class="terminal-title">SESSION LOG</span>
+          </div>
+          <div class="terminal-body" id="terminalBody">
+            <div class="log-line init">$ zoomscribe started</div>
+          </div>
+        </div>
+
+        <!-- Downloads -->
+        <div class="downloads-section hidden" id="downloadsSection">
+          <div class="downloads-title">OUTPUTS READY</div>
+          <div class="downloads-grid" id="downloadsGrid"></div>
+        </div>
+
+        <!-- Error display -->
+        <div class="error-box hidden" id="errorBox">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" /></svg>
+          <span id="errorMsg"></span>
+        </div>
+
+        <div class="job-actions">
+          <button class="btn-stop hidden" id="btnStop" onclick="stopRecording()">
+            <span class="btn-text">Stop Recording</span>
+            <div class="btn-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg>
+            </div>
+          </button>
+          <button class="btn-secondary" onclick="startNew()">
+            + New Session
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Past sessions -->
+    <section class="history-section" id="historySection">
+      <div class="section-header">
+        <span class="section-label">SESSION HISTORY</span>
+        <button class="btn-ghost" onclick="loadHistory()">Refresh</button>
+        <button class="btn-ghost" onclick="loadHistory()">↻ Refresh</button>
+      </div>
+      <div id="historyList" class="history-list">
+        <div class="empty-state">No sessions yet. Start your first recording above.</div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span>ZoomScribe v1.0 · Powered by AssemblyAI</span>
+    <span class="footer-sep">·</span>
+    <span>All recordings stored locally</span>
+  </footer>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
