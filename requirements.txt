@@ -1,9 +1,9 @@
 fastapi
 uvicorn[standard]
-python-multipart
-jinja2
 playwright
 requests
 reportlab
 python-dotenv
-moviepy
+pydantic
+jinja2
+aiofiles

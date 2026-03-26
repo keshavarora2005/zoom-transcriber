@@ -3,14 +3,13 @@ main.py - FastAPI Web Interface for Zoom Meeting Transcriber
 
 Run with:
     python main.py
-    
-DO NOT use: uvicorn main:app directly on Windows — use python main.py instead.
 """
 
-# ── Windows asyncio fix — MUST be first, before ANY other imports ─────────────
+# ── asyncio fix — must be first ───────────────────────────────────────────────
 import sys
 import asyncio
 
+# Only apply Windows fix on Windows — Render runs Linux
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -47,11 +46,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("web_interface")
 
 app = FastAPI(title="Zoom Meeting Transcriber", version="1.0.0")
+
+# ── Static files & templates — create dirs if missing (safety net) ────────────
+Path("static").mkdir(exist_ok=True)
+Path("templates").mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-RECORDINGS_DIR = Path("./recordings")
-RECORDINGS_DIR.mkdir(exist_ok=True)
+# ── Use /app/recordings on Render (persistent disk), fallback to local ────────
+RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "./recordings"))
+RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 jobs: dict = {}
 
@@ -84,13 +88,12 @@ async def run_job(job_id: str, req: StartRequest):
         job["out_dir"] = str(out_dir)
 
         if not req.skip_transcript and not os.getenv("API_KEY"):
-            raise RuntimeError("API_KEY not found in environment. Add it to your .env file.")
+            raise RuntimeError("API_KEY not found in environment. Set it in the Render dashboard under Environment Variables.")
 
         writer = ChunkWriter(webm_path)
         job["status"] = "recording"
         log_job("🎙️ Joining meeting and starting recording...")
 
-        # Create a function to check for manual stop
         def should_stop():
             return jobs[job_id].get("manual_stop", False)
 
@@ -121,16 +124,14 @@ async def run_job(job_id: str, req: StartRequest):
             log_job(f"✅ Transcript PDF ready: {pdf_path.name}")
             job["status"] = "done"
             log_job("🎉 All done!")
-
         else:
             job["status"] = "done"
             log_job("🎉 Recording completed (transcript skipped)")
 
     except Exception as e:
         log.error(f"Job {job_id} failed: {e}", exc_info=True)
-        job["status"] = "error"
-        job.setdefault("logs", []).append(f"❌ Error: {e}")
         job["status"] = "failed"
+        job.setdefault("logs", []).append(f"❌ Error: {e}")
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -170,7 +171,7 @@ async def stream_logs(job_id: str):
                 line = logs_list[sent]
                 yield f"data: {json.dumps({'log': line, 'status': job.get('status')})}\n\n"
                 sent += 1
-            if job.get("status") in ("done", "error"):
+            if job.get("status") in ("done", "failed", "error"):
                 yield f"data: {json.dumps({'done': True, 'status': job.get('status'), 'job': job})}\n\n"
                 break
             await asyncio.sleep(1)
@@ -195,15 +196,11 @@ async def download_file(job_id: str, file_type: str):
 async def stop_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
-    
     job = jobs[job_id]
     if job.get("status") != "recording":
         raise HTTPException(400, "Job is not currently recording")
-    
-    # Set a flag to indicate manual stop request
     job["manual_stop"] = True
     job["status"] = "stopping"
-    
     return {"message": "Stop request sent", "job_id": job_id}
 
 @app.delete("/api/job/{job_id}")
@@ -225,7 +222,7 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),  # Use PORT env var
+        port=int(os.environ.get("PORT", 8000)),
         reload=False,
-        loop="none",
+        # Do NOT set loop="none" on Linux — let uvicorn pick the default
     )
