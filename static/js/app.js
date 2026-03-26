@@ -112,25 +112,26 @@ function appendLog(msg, type = '') {
 async function startJob() {
   console.log('startJob called');
   
-  const zoomLink      = document.getElementById('zoomLink').value.trim();
-  const displayName   = document.getElementById('displayName').value.trim() || 'Recorder';
-  const maxMinutes    = parseInt(document.getElementById('maxMinutes').value) || 180;
-  const skipTranscript = false; // Always generate transcript
-  const showBrowser    = false; // Always headless mode
-
-  console.log('Form values:', { zoomLink, displayName, maxMinutes });
-
-  if (!zoomLink) {
-    console.log('No zoom link provided');
-    shakeInput('zoomLink');
-    return;
-  }
-
-  const btn = document.getElementById('btnStart');
-  btn.classList.add('loading');
-  btn.querySelector('.btn-text').textContent = 'Starting…';
-
   try {
+    const zoomLink      = document.getElementById('zoomLink').value.trim();
+    const displayName   = document.getElementById('displayName').value.trim() || 'Recorder';
+    const maxMinutes    = parseInt(document.getElementById('maxMinutes').value) || 180;
+    const skipTranscript = false; // Always generate transcript
+    const showBrowser    = false; // Always headless mode
+
+    console.log('Form values:', { zoomLink, displayName, maxMinutes });
+
+    if (!zoomLink) {
+      console.log('No zoom link provided');
+      shakeInput('zoomLink');
+      return;
+    }
+
+    const btn = document.getElementById('btnStart');
+    console.log('Button found:', btn);
+    btn.classList.add('loading');
+    btn.querySelector('.btn-text').textContent = 'Starting…';
+
     console.log('Sending request to /api/start');
     const res = await fetch('/api/start', {
       method: 'POST',
@@ -145,8 +146,12 @@ async function startJob() {
     });
 
     console.log('Response status:', res.status);
+    console.log('Response headers:', res.headers);
+    
     if (!res.ok) {
-      const err = await res.json();
+      const errorText = await res.text();
+      console.error('Error response:', errorText);
+      const err = errorText ? JSON.parse(errorText) : {detail: 'Unknown error'};
       throw new Error(err.detail || 'Failed to start job');
     }
 
@@ -158,8 +163,11 @@ async function startJob() {
   } catch (e) {
     console.error('Error in startJob:', e);
     showToast('Error: ' + e.message, 'error');
-    btn.classList.remove('loading');
-    btn.querySelector('.btn-text').textContent = 'Start Recording Session';
+    const btn = document.getElementById('btnStart');
+    if (btn) {
+      btn.classList.remove('loading');
+      btn.querySelector('.btn-text').textContent = 'Start Recording Session';
+    }
   }
 }
 
