@@ -1,13 +1,15 @@
 services:
   - type: web
     name: zoom-transcriber
-    runtime: docker           # ← Docker runs as root during build, so apt-get works
+    runtime: docker
     dockerfilePath: ./Dockerfile
     envVars:
       - key: API_KEY
         sync: false           # Paste your AssemblyAI key in Render dashboard
       - key: RECORDINGS_DIR
         value: /app/recordings
+      - key: PORT
+        value: 10000          # Explicit port — must match Dockerfile EXPOSE and uvicorn
     disk:
       name: recordings
       mountPath: /app/recordings

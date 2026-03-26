@@ -15,8 +15,6 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # ── CRITICAL: store Playwright browsers INSIDE the image, not in ~/.cache ─────
-# /opt/render/.cache is a host path that is NOT part of the Docker image layer.
-# Setting this env var before `playwright install` bakes Chromium into /app/pw-browsers.
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/pw-browsers
 
 # Install Python deps (cached layer — changes only when requirements.txt changes)
@@ -32,10 +30,10 @@ COPY . .
 # Create required runtime directories
 RUN mkdir -p recordings static templates
 
-# Runtime environment
-ENV PORT=8000
+# Runtime environment — port 10000 matches Render's detection
+ENV PORT=10000
 ENV RECORDINGS_DIR=/app/recordings
 
-EXPOSE 8000
+EXPOSE 10000
 
 CMD ["python", "main.py"]

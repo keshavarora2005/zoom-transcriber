@@ -218,10 +218,10 @@ def build_join_url(meeting_id: str, passcode: Union[str, None]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 STATES = {
-    "name_input":     "input#inputname, input[placeholder*='Your Name' i], input[placeholder*='name' i], input[placeholder*='Enter your name' i], input[type='text']",
+    # input#input-for-name confirmed from live DOM dump 2025-05-25
+    "name_input":     "input#input-for-name, input#inputname, input[placeholder*='Your Name' i], input[placeholder*='name' i], input[placeholder*='Enter your name' i]",
     "passcode_input": "input#inputpasscode, input[placeholder*='passcode' i], input[placeholder*='password' i]",
     "waiting_room":   "[class*='waitingRoom'], [class*='waiting-room'], div:has-text('Waiting for host')",
-    "joining":        "div:has-text('Joining Meeting'), [class*='join-meeting'], div:has-text('Joining')",
     "audio_dialog":   "[class*='join-audio-by-voip'], button:has-text('Join with Computer Audio'), button:has-text('Join Audio'), button:has-text('Test Speaker')",
     "in_meeting":     "#wc-footer, [class*='footer-container'], [class*='meeting-app'], div[role='main']",
     "meeting_ended":  "[class*='meeting-ended'], div:has-text('meeting has been ended by the host'), div:has-text('This meeting has been ended')",
@@ -561,35 +561,23 @@ async def run_bot(
 
         if current_state not in ["in_meeting", "audio_dialog"]:
             log.info(f"Waiting for name input (will enter '{display_name}')...")
-            ns = await wait_state(page, ["name_input"], 20, debug_dir=debug_dir, tag="name")
+            # Also accept 'joining' — Zoom shows a preview screen before name input
+            ns = await wait_state(page, ["name_input", "joining"], 30, debug_dir=debug_dir, tag="name")
+
+            # If we landed on the preview/joining screen, wait for name_input to appear
+            if ns == "joining":
+                log.info("  On preview screen — waiting for name_input to appear...")
+                ns = await wait_state(page, ["name_input"], 20, debug_dir=debug_dir, tag="preview")
 
             if ns == "name_input":
-                # ── Step 1: Wait for input to be truly ready ──────────────────
+                # ── Step 1: Wait 2s for the preview UI to fully render ─────────
                 await asyncio.sleep(2)
 
-                # ── Step 2: Dump all clickable elements for one-time diagnosis ─
-                try:
-                    all_btns = await page.query_selector_all("button, [role='button'], [class*='btn'], [class*='join']")
-                    log.info(f"  Found {len(all_btns)} clickable element(s) on page:")
-                    for i, b in enumerate(all_btns[:10]):
-                        txt  = (await b.text_content() or "").strip()
-                        cls  = (await b.get_attribute("class") or "")[:60]
-                        role = (await b.get_attribute("role") or "")
-                        eid  = (await b.get_attribute("id") or "")
-                        log.info(f"    [{i}] tag=? id={eid!r} role={role!r} class={cls!r} text={txt!r}")
-                    all_inputs = await page.query_selector_all("input")
-                    log.info(f"  Found {len(all_inputs)} input(s):")
-                    for i, inp in enumerate(all_inputs[:5]):
-                        typ = (await inp.get_attribute("type") or "")
-                        ph  = (await inp.get_attribute("placeholder") or "")
-                        eid = (await inp.get_attribute("id") or "")
-                        log.info(f"    [{i}] type={typ!r} id={eid!r} placeholder={ph!r}")
-                except Exception as de:
-                    log.warning(f"  DOM dump failed: {de}")
-
-                # ── Step 3: Enter display name ────────────────────────────────
+                # ── Step 2: Enter display name ────────────────────────────────
+                # Confirmed from DOM dump: id='input-for-name', type='text'
                 name_entered = False
                 name_selectors = [
+                    "input#input-for-name",        # ✅ confirmed from DOM dump
                     "input#inputname",
                     "input[placeholder*='Your Name' i]",
                     "input[placeholder*='Enter your name' i]",
@@ -610,127 +598,121 @@ async def run_bot(
                         break
 
                 if not name_entered:
-                    log.warning("  Could not find name input via any selector — trying JS inject")
+                    log.warning("  No name input found — trying JS inject")
                     try:
-                        await page.evaluate(f"""
-                            const inp = document.querySelector('input');
-                            if (inp) {{
-                                inp.value = '';
-                                inp.focus();
-                                document.execCommand('selectAll');
-                                document.execCommand('insertText', false, '{display_name}');
-                            }}
-                        """)
-                        log.info("  Name injected via JS execCommand")
+                        await page.evaluate(
+                            """(name) => {
+                                const inp = document.querySelector('input#input-for-name, input[type="text"], input');
+                                if (inp) {
+                                    inp.focus();
+                                    inp.value = '';
+                                    document.execCommand('selectAll');
+                                    document.execCommand('insertText', false, name);
+                                }
+                            }""",
+                            display_name,
+                        )
+                        log.info("  Name injected via JS")
                         name_entered = True
                     except Exception as je:
                         log.warning(f"  JS name inject failed: {je}")
 
-                await asyncio.sleep(1)
+                # ── Step 3: Wait for the Join button to become ENABLED ─────────
+                # From DOM dump: class='zm-btn preview-join-button disabled zm-btn--default zm-btn__'
+                # The 'disabled' class is removed once a name is typed. Poll up to 10s.
+                log.info("  Waiting for Join button to become enabled...")
+                join_btn_el = None
+                for _ in range(20):   # 20 × 0.5s = 10s max
+                    # Target the specific Zoom preview join button
+                    el = await page.query_selector("[class*='preview-join-button']:not([class*='disabled'])")
+                    if el:
+                        join_btn_el = el
+                        log.info("  Join button is now enabled")
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    log.warning("  Join button never became enabled — attempting click anyway")
+                    join_btn_el = await page.query_selector("[class*='preview-join-button']")
 
-                # ── Step 4: Click Join — buttons AND div/role="button" elements ─
-                async def try_click_join() -> bool:
-                    # 4a: standard <button> selectors
+                # ── Step 4: Click the Join button ─────────────────────────────
+                join_clicked = False
+                if join_btn_el:
+                    try:
+                        await join_btn_el.click()
+                        log.info("  Join clicked (preview-join-button)")
+                        join_clicked = True
+                    except Exception as ce:
+                        log.warning(f"  preview-join-button click failed: {ce}")
+
+                if not join_clicked:
+                    # Fallback: try any button/element with text "Join" that isn't "Joining"
                     for sel in [
                         "button#joinBtn",
                         "button[type='submit']",
                         "button:has-text('Join')",
-                        "button:has-text('Join Meeting')",
-                        "button[aria-label*='Join' i]",
-                    ]:
-                        try:
-                            el = await page.query_selector(sel)
-                            if el:
-                                await el.click()
-                                log.info(f"  Join clicked via button selector ({sel})")
-                                return True
-                        except Exception:
-                            pass
-
-                    # 4b: div / span / any element acting as a button (Zoom often does this)
-                    for sel in [
-                        "[role='button']:has-text('Join')",
-                        "div:has-text('Join Meeting')",
                         "[class*='join-btn']",
                         "[class*='joinBtn']",
-                        "[class*='join_btn']",
-                        "[id*='join']",
                     ]:
                         try:
                             el = await page.query_selector(sel)
                             if el:
-                                await el.click()
-                                log.info(f"  Join clicked via role/div selector ({sel})")
-                                return True
+                                cls = (await el.get_attribute("class") or "")
+                                if "disabled" not in cls:
+                                    await el.click()
+                                    log.info(f"  Join clicked via fallback ({sel})")
+                                    join_clicked = True
+                                    break
                         except Exception:
                             pass
 
-                    # 4c: scan ALL elements whose text contains "join" (but exclude "joining")
-                    try:
-                        candidates = await page.query_selector_all("button, [role='button'], div, span, a")
-                        for el in candidates:
-                            txt = (await el.text_content() or "").strip().lower()
-                            # Only click actual join buttons, not status indicators
-                            if txt in ("join", "join meeting", "join now") and "joining" not in txt:
-                                await el.click()
-                                log.info(f"  Join clicked via text scan: {txt!r}")
-                                return True
-                    except Exception as se:
-                        log.warning(f"  Text scan failed: {se}")
-
-                    return False
-
-                join_clicked = await try_click_join()
-
                 if not join_clicked:
-                    log.warning("  No Join element found — pressing Enter as last resort")
+                    log.warning("  All Join selectors failed — pressing Enter")
                     await page.keyboard.press("Enter")
 
-                # ── Step 5: Wait for join to complete and handle next state ────────
+                # ── Step 5: Wait for state to advance past name_input ─────────
                 await asyncio.sleep(5)
                 recheck = await get_state(page)
-                log.info(f"  State after join attempt: {recheck!r}")
+                log.info(f"  State after join: {recheck!r}")
 
                 if recheck == "name_input":
-                    log.warning("  Still on name_input — second join attempt...")
-                    await try_click_join()
-                    await asyncio.sleep(5)
-                    recheck = await get_state(page)
-                    log.info(f"  State after second join attempt: {recheck!r}")
-                elif recheck == "joining":
-                    log.info("  Joining in progress — waiting for transition...")
-                    # Wait for joining to complete (can take 10-15 seconds)
-                    # But also check for manual stop during this phase
-                    join_start = time.time()
-                    join_timeout = 30  # Maximum 30 seconds for joining
-                    
-                    while time.time() - join_start < join_timeout:
-                        # Check manual stop while joining
-                        if manual_stop_check and manual_stop_check():
-                            log.info("Manual stop received during joining — aborting...")
-                            await browser.close()
-                            return
-                        
-                        join_result = await get_state(page)
-                        if join_result in ["audio_dialog", "in_meeting", "waiting_room"]:
-                            log.info(f"  Join completed: {join_result!r}")
-                            recheck = join_result
-                            break
-                        await asyncio.sleep(1)
+                    log.warning("  Still on name_input — one more attempt...")
+                    # Re-check if button is enabled now
+                    el = await page.query_selector("[class*='preview-join-button']:not([class*='disabled'])")
+                    if el:
+                        await el.click()
+                        log.info("  Second join click sent")
                     else:
-                        log.warning("  Joining timed out - trying manual refresh...")
-                        if manual_stop_check and manual_stop_check():
-                            log.info("Manual stop received during joining timeout — aborting...")
-                            await browser.close()
-                            return
-                        await page.reload(wait_until="domcontentloaded")
-                        await asyncio.sleep(3)
-                        recheck = await get_state(page)
-                        log.info(f"  State after refresh: {recheck!r}")
-                else:
-                    log.info(f"  Join successful - moved to state: {recheck!r}")
-                    # Add a small delay to let the page settle after joining
-                    await asyncio.sleep(2)
+                        await page.keyboard.press("Enter")
+                    await asyncio.sleep(5)
+
+            else:
+                log.warning(f"Name field not shown ({ns}) — trying direct fallback...")
+                try:
+                    # Try confirmed id first, then generic
+                    for name_sel in ["input#input-for-name", "input[type='text']", "input:not([type='hidden'])"]:
+                        inp = await page.query_selector(name_sel)
+                        if inp:
+                            await inp.click()
+                            await inp.press("Control+a")
+                            await inp.press("Backspace")
+                            await asyncio.sleep(0.3)
+                            await inp.type(display_name, delay=80)
+                            log.info(f"  Name entered via fallback ({name_sel})")
+                            break
+                    await asyncio.sleep(1)
+                    for sel in [
+                        "[class*='preview-join-button']:not([class*='disabled'])",
+                        "button:has-text('Join')",
+                        "button[type='submit']",
+                    ]:
+                        btn = await page.query_selector(sel)
+                        if btn:
+                            await btn.click()
+                            log.info(f"  Join clicked via fallback ({sel})")
+                            break
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    log.warning(f"Fallback failed: {e}")
 
         if await get_state(page) == "passcode_input":
             if passcode:
@@ -799,7 +781,6 @@ async def run_bot(
         last_log  = time.time()
 
         while time.time() < deadline:
-            # Check manual stop more frequently (every 1 second instead of 5)
             if manual_stop_check and manual_stop_check():
                 log.info("Manual stop received — finishing recording...")
                 break
@@ -816,8 +797,7 @@ async def run_bot(
                     f"{writer.bytes/1_048_576:.1f} MB, {track_count['n']} track(s)"
                 )
                 last_log = time.time()
-            # Reduced sleep time for faster stop response
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
         else:
             log.warning(f"Max recording time ({max_min} min) reached.")
 
