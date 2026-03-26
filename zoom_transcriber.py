@@ -724,7 +724,9 @@ async def run_bot(
                         await asyncio.sleep(3)
 
             else:
-                log.warning(f"Name field not shown ({ns}) — trying fallback...")
+                log.info(f"  Join successful - moved to state: {recheck!r}")
+                # Add a small delay to let the page settle after joining
+                await asyncio.sleep(2)
                 try:
                     inputs = await page.query_selector_all("input[type='text'], input:not([type])")
                     for inp in inputs:
