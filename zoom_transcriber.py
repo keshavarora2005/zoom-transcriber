@@ -698,10 +698,28 @@ async def run_bot(
                 elif recheck == "joining":
                     log.info("  Joining in progress — waiting for transition...")
                     # Wait for joining to complete (can take 10-15 seconds)
-                    join_result = await wait_state(page, ["audio_dialog", "in_meeting", "waiting_room"], 20, debug_dir=debug_dir, tag="joining")
-                    log.info(f"  Join result: {join_result!r}")
-                    if join_result in ["timeout", "error"]:
+                    # But also check for manual stop during this phase
+                    join_start = time.time()
+                    join_timeout = 30  # Maximum 30 seconds for joining
+                    
+                    while time.time() - join_start < join_timeout:
+                        # Check manual stop while joining
+                        if manual_stop_check and manual_stop_check():
+                            log.info("Manual stop received during joining — aborting...")
+                            await browser.close()
+                            return
+                        
+                        join_result = await get_state(page)
+                        if join_result in ["audio_dialog", "in_meeting", "waiting_room"]:
+                            log.info(f"  Join completed: {join_result!r}")
+                            break
+                        await asyncio.sleep(1)
+                    else:
                         log.warning("  Joining timed out - trying manual refresh...")
+                        if manual_stop_check and manual_stop_check():
+                            log.info("Manual stop received during joining timeout — aborting...")
+                            await browser.close()
+                            return
                         await page.reload(wait_until="domcontentloaded")
                         await asyncio.sleep(3)
 
