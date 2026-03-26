@@ -1,28 +1,5 @@
 """
 zoom_transcriber.py - Combined Zoom Meeting Recorder and Transcriber
-======================================================================
-Records Zoom meeting audio and transcribes it to PDF in one integrated workflow.
-
-INSTALL
--------
-    pip install playwright moviepy requests reportlab python-dotenv
-    playwright install chromium
-    
-    # Optional (for wav/mp3 output):
-    #   Windows : winget install ffmpeg
-    #   Linux   : sudo apt install ffmpeg
-
-USAGE
------
-    python zoom_transcriber.py "https://us04web.zoom.us/j/XXXX?pwd=YYY"
-    python zoom_transcriber.py "https://..." --no-headless   # see the browser
-    python zoom_transcriber.py "https://..." --debug         # save screenshots
-    python zoom_transcriber.py "https://..." --help
-
-ENVIRONMENT
------------
-Create a .env file with:
-    API_KEY=your_assemblyai_api_key
 """
 
 import argparse
@@ -36,7 +13,6 @@ import signal
 import subprocess
 import sys
 import time
-import tempfile
 import os
 import requests
 from pathlib import Path
@@ -44,7 +20,6 @@ from typing import Union, Callable, List
 from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import Page, BrowserContext, async_playwright
-# from moviepy.editor import VideoFileClip  # Not needed for audio-only processing
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -52,9 +27,7 @@ from reportlab.lib.units import inch
 from dotenv import load_dotenv
 
 load_dotenv()
-os.environ["API_KEY"] = os.getenv("API_KEY")
 
-# ── logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -62,17 +35,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("zoom_transcriber")
 
-# ── AssemblyAI Configuration ─────────────────────────────────────────────────
 base_url = "https://api.assemblyai.com/v2"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JS hook - injected via add_init_script() so it runs BEFORE any page JS.
-# Strategy: Record Zoom meeting audio by hooking RTCPeerConnection
+# JS hook
 # ─────────────────────────────────────────────────────────────────────────────
 
 INIT_SCRIPT = r"""
 (function() {
-    // ── shared state ──────────────────────────────────────────────────────
     window.__ZR = window.__ZR || {
         recorder:    null,
         destStream:  null,
@@ -83,7 +53,6 @@ INIT_SCRIPT = r"""
     };
     const ZR = window.__ZR;
 
-    // ── lazy-initialise AudioContext + MediaRecorder ───────────────────────
     function ensureRecorder() {
         if (ZR.recorder && ZR.recorder.state !== 'inactive') return;
 
@@ -98,7 +67,6 @@ INIT_SCRIPT = r"""
             if (!e.data || e.data.size === 0) return;
             const ab  = await e.data.arrayBuffer();
             const u8  = new Uint8Array(ab);
-            // btoa in chunks to avoid stack overflow on large buffers
             let bin = '';
             for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
             console.log('AUDIO_CHUNK::' + btoa(bin));
@@ -108,23 +76,16 @@ INIT_SCRIPT = r"""
         ZR.recorder.start(1000);
     }
 
-    // ── Suppress beep/notification sounds ─────────────────────────────────────
-    const NativeOscillator = window.OscillatorNode;
-    const NativeAudioBufferSource = window.AudioBufferSourceNode;
-    const NativeGain = window.GainNode;
+    // ── Aggressively suppress ALL notification / beep sounds ─────────────────
+    // Strategy: intercept createOscillator and createBufferSource at the
+    // AudioContext level. Any short buffer (<3s) or oscillator that is NOT
+    // connected to our ZR.dest gets its gain zeroed before it reaches output.
 
-    // Patch createOscillator — kills "ding" tones
     const _createOscillator = AudioContext.prototype.createOscillator;
     AudioContext.prototype.createOscillator = function() {
         const osc = _createOscillator.apply(this, arguments);
-        osc.frequency.value = 0;
-        const origConnect = osc.connect.bind(osc);
-        osc.connect = function(target) {
-            if (target === window.__ZR && target === window.__ZR.dest) {
-                return origConnect(target);
-            }
-            return origConnect(target);
-        };
+        // Zero out frequency so it produces silence
+        try { osc.frequency.value = 0; } catch(_) {}
         return osc;
     };
 
@@ -133,9 +94,10 @@ INIT_SCRIPT = r"""
         const src = _createBufferSource.apply(this, arguments);
         const origStart = src.start.bind(src);
         src.start = function(when, offset, duration) {
-            if (src.buffer && src.buffer.duration < 2.0) {
-                src.disconnect();
-                console.log('ZOOM_REC::beep_suppressed duration=' + (src.buffer.duration).toFixed(3));
+            // Block any short sound effect (beeps, chimes, notifications)
+            if (src.buffer && src.buffer.duration < 3.0) {
+                try { src.disconnect(); } catch(_) {}
+                console.log('ZOOM_REC::beep_suppressed duration=' + (src.buffer ? src.buffer.duration.toFixed(3) : 'unknown'));
                 return;
             }
             return origStart(when, offset, duration);
@@ -143,7 +105,23 @@ INIT_SCRIPT = r"""
         return src;
     };
 
-    // ── connect a MediaStreamTrack to the recorder ─────────────────────────
+    // Also patch GainNode to catch Zoom routing beeps through gain stages
+    const _createGain = AudioContext.prototype.createGain;
+    AudioContext.prototype.createGain = function() {
+        const gain = _createGain.apply(this, arguments);
+        // Watch for very short gain envelopes (notification sounds)
+        const origConnect = gain.connect.bind(gain);
+        gain.connect = function(target) {
+            // If this gain node is connected to destination (speakers) but NOT
+            // our ZR.dest, it's a notification — mute it
+            if (target && target === this.context && target === this.context.destination) {
+                gain.gain.value = 0;
+            }
+            return origConnect(target);
+        };
+        return gain;
+    };
+
     function connectTrack(track, label) {
         if (ZR.connected.has(track)) return;
         ZR.connected.add(track);
@@ -158,14 +136,12 @@ INIT_SCRIPT = r"""
         console.log('ZOOM_REC::track_connected label=' + label + ' total=' + ZR.trackCount);
     }
 
-    // ── mute any <audio>/<video> DOM elements Zoom might use ──────────────
     function silenceElement(el) {
         el.muted  = true;
         el.volume = 0;
         if (el.srcObject) el.srcObject.getAudioTracks().forEach(t => connectTrack(t, 'elem_muted_' + t.id));
     }
 
-    // ── hook RTCPeerConnection (the main path for Zoom WebRTC audio) ───────
     const NativePeerConn = window.RTCPeerConnection;
     window.RTCPeerConnection = function(...args) {
         const pc = new NativePeerConn(...args);
@@ -183,7 +159,6 @@ INIT_SCRIPT = r"""
         try { window.RTCPeerConnection[k] = NativePeerConn[k]; } catch(_) {}
     });
 
-    // ── also hook getUserMedia (local fallback path) ───────────────────────
     const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
     navigator.mediaDevices.getUserMedia = async (constraints) => {
         const stream = await origGUM(constraints);
@@ -191,7 +166,6 @@ INIT_SCRIPT = r"""
         return stream;
     };
 
-    // ── hook <audio>/<video> elements as a fallback ────────────────────────
     function tryConnectElement(el) {
         if (ZR.connected.has(el)) return;
         ZR.connected.add(el);
@@ -217,6 +191,8 @@ INIT_SCRIPT = r"""
 })();
 """
 
+# Stop the MediaRecorder cleanly, THEN navigate away so Zoom's
+# leave-meeting chime never fires into our recording
 STOP_JS = """
 (function(){
     const r = window.__ZR && window.__ZR.recorder;
@@ -300,11 +276,6 @@ async def wait_state(
             return "error"
         await asyncio.sleep(poll)
     log.warning(f"Timeout waiting for {want}  last={last!r}")
-    if debug_dir:
-        try:
-            await page.screenshot(path=str(debug_dir / "timeout.png"))
-        except Exception:
-            pass
     return "timeout"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,8 +283,6 @@ async def wait_state(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChunkWriter:
-    """Receives base64 audio/webm chunks from the browser and appends to file."""
-
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path   = path
@@ -339,169 +308,150 @@ class ChunkWriter:
 
     @property
     def duration_est(self) -> float:
-        return float(self.chunks)   # ≈ seconds (1 chunk/s)
+        return float(self.chunks)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ffmpeg conversions
+# ffmpeg helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_ffmpeg(args: List[str]) -> bool:
-    if not shutil.which("ffmpeg"):
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        log.warning("ffmpeg not found in PATH — skipping conversion")
         return False
-    r = subprocess.run(["ffmpeg", "-y"] + args, capture_output=True, text=True)
+    r = subprocess.run([ffmpeg_path, "-y"] + args, capture_output=True, text=True)
     if r.returncode != 0:
         log.warning(f"ffmpeg failed:\n{r.stderr[-400:]}")
         return False
     return True
 
-def to_wav(src: Path) -> Union[Path, None]:
-    out = src.with_suffix(".wav")
-    ok  = _run_ffmpeg(["-i", str(src), "-ar", "44100", "-ac", "2", str(out)])
-    if ok:
-        log.info(f"WAV: {out}  ({out.stat().st_size/1_048_576:.1f} MB)")
-        return out
-    return None
-
 def to_mp3(src: Path, bitrate: str = "128k") -> Union[Path, None]:
     out = src.with_suffix(".mp3")
-    ok  = _run_ffmpeg(["-i", str(src), "-codec:a", "libmp3lame", "-b:a", bitrate, str(out)])
-    if ok:
+    # -vn = no video, just audio stream
+    ok = _run_ffmpeg(["-i", str(src), "-vn", "-codec:a", "libmp3lame", "-b:a", bitrate, str(out)])
+    if ok and out.exists() and out.stat().st_size > 0:
         log.info(f"MP3: {out}  ({out.stat().st_size/1_048_576:.1f} MB)")
         return out
+    log.warning("MP3 conversion failed or produced empty file — will upload webm directly")
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Transcription functions
+# Transcription
 # ─────────────────────────────────────────────────────────────────────────────
 
 def upload_audio_file(file_path):
-    """Upload local audio file to AssemblyAI"""
     headers = {"authorization": os.getenv("API_KEY")}
-    
+    log.info(f"Uploading {Path(file_path).name} ({Path(file_path).stat().st_size / 1_048_576:.1f} MB)...")
     with open(file_path, "rb") as f:
-        response = requests.post(base_url + "/upload", 
-                               headers=headers, 
-                               files={"file": f})
-    
+        response = requests.post(
+            base_url + "/upload",
+            headers=headers,
+            data=f,                          # stream upload — avoids loading entire file into RAM
+            timeout=300,
+        )
     if response.status_code == 200:
         audio_url = response.json()["upload_url"]
-        log.info(f"📤 Upload successful: {audio_url}")
+        log.info(f"Upload successful")
         return audio_url
     else:
-        raise RuntimeError(f"❌ Upload failed: {response.status_code} - {response.text}")
+        raise RuntimeError(f"Upload failed: {response.status_code} - {response.text}")
 
 def transcribe_audio(audio_url):
-    """Transcribe audio using AssemblyAI API with SPEAKER LABELS"""
     headers = {"authorization": os.getenv("API_KEY"), "content-type": "application/json"}
     data = {
         "audio_url": audio_url,
-        "speech_models": ["universal"],
+        "speech_model": "universal",         # NOTE: singular "speech_model", not "speech_models"
         "language_detection": True,
         "punctuate": True,
         "format_text": True,
         "speaker_labels": True,
     }
-    
-    log.info("🔄 Submitting transcription request with speaker labels...")
+
+    log.info("Submitting transcription request...")
     response = requests.post(base_url + "/transcript", json=data, headers=headers)
-    
+
     if response.status_code != 200:
-        raise RuntimeError(f"❌ Transcription request failed: {response.status_code} - {response.text}")
-    
+        raise RuntimeError(f"Transcription request failed: {response.status_code} - {response.text}")
+
     response_data = response.json()
     if 'id' not in response_data:
-        raise RuntimeError(f"❌ Invalid response from AssemblyAI: {response_data}")
-    
+        raise RuntimeError(f"Invalid response from AssemblyAI: {response_data}")
+
     transcript_id = response_data['id']
-    log.info(f"📄 Transcription ID: {transcript_id}")
-    
+    log.info(f"Transcription ID: {transcript_id}")
+
     polling_endpoint = base_url + f"/transcript/{transcript_id}"
     while True:
         result = requests.get(polling_endpoint, headers=headers).json()
-        
         if result['status'] == 'completed':
-            log.info("✅ Transcription complete with speakers!")
+            log.info("Transcription complete!")
             return result
         elif result['status'] == 'error':
-            raise RuntimeError(f"❌ Transcription failed: {result['error']}")
+            raise RuntimeError(f"Transcription failed: {result.get('error', 'unknown error')}")
         else:
-            log.info(f"⏳ Processing... ({result['status']})")
+            log.info(f"Processing... ({result['status']})")
             time.sleep(3)
 
 def format_speaker_transcript(result):
-    """Convert AssemblyAI result to speaker-formatted text"""
-    if 'utterances' not in result:
-        log.warning("⚠️ No speaker data found - falling back to plain text")
+    if 'utterances' not in result or not result['utterances']:
+        log.warning("No speaker data — falling back to plain text")
         return result.get('text', 'No transcript available')
-    
-    # Debug: Log the number of speakers detected
-    speakers = set()
-    for utterance in result['utterances']:
-        speakers.add(utterance.get('speaker', 'Unknown'))
-    log.info(f"🎯 Detected {len(speakers)} speakers: {sorted(speakers)}")
-    
-    formatted_lines = []
-    for utterance in result['utterances']:
-        speaker = utterance.get('speaker', 'Unknown')
-        text = utterance.get('text', '').strip()
+
+    speakers = set(u.get('speaker', 'Unknown') for u in result['utterances'])
+    log.info(f"Detected {len(speakers)} speaker(s): {sorted(speakers)}")
+
+    lines = []
+    for u in result['utterances']:
+        speaker = u.get('speaker', 'Unknown')
+        text    = u.get('text', '').strip()
         if text:
-            formatted_lines.append(f"Speaker {speaker}: {text}")
-    
-    return '\n\n'.join(formatted_lines)
+            lines.append(f"Speaker {speaker}: {text}")
+
+    return '\n\n'.join(lines)
 
 def save_transcript_as_pdf(result, output_pdf="meeting_transcript.pdf"):
-    """Save SPEAKER transcript as formatted PDF"""
-    log.info("📄 Creating PDF with speaker labels...")
-    
-    doc = SimpleDocTemplate(output_pdf, pagesize=letter)
+    log.info("Creating PDF...")
+    doc    = SimpleDocTemplate(output_pdf, pagesize=letter)
     styles = getSampleStyleSheet()
-    
+
     title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Title'],
-        fontSize=24,
-        spaceAfter=30,
-        alignment=1
+        'CustomTitle', parent=styles['Title'],
+        fontSize=24, spaceAfter=30, alignment=1
     )
-    
-    story = []
-    story.append(Paragraph("Meeting Transcript with Speaker Labels", title_style))
-    story.append(Spacer(1, 20))
-    
-    speaker_formatted_text = format_speaker_transcript(result)
-    
     content_style = ParagraphStyle(
-        'SpeakerContent',
-        parent=styles['Normal'],
-        fontSize=11,
-        spaceAfter=8,
-        leftIndent=20
+        'SpeakerContent', parent=styles['Normal'],
+        fontSize=11, spaceAfter=8, leftIndent=20
     )
-    
-    paragraphs = speaker_formatted_text.split('\n\n')
-    for para in paragraphs:
-        if para.strip():
-            clean_para = para.strip()
-            clean_para = ''.join(char for char in clean_para if char.isprintable() or char in '\n\t')
-            clean_para = clean_para.replace('\x00', '').replace('\ufffd', '')
-            
-            story.append(Paragraph(clean_para, content_style))
-    
+
+    story = [
+        Paragraph("Meeting Transcript with Speaker Labels", title_style),
+        Spacer(1, 20),
+    ]
+
+    text = format_speaker_transcript(result)
+    for para in text.split('\n\n'):
+        para = para.strip()
+        if para:
+            # Sanitise for ReportLab
+            para = ''.join(c for c in para if c.isprintable() or c in '\n\t')
+            para = para.replace('\x00', '').replace('\ufffd', '')
+            story.append(Paragraph(para, content_style))
+
     doc.build(story)
-    log.info(f"✅ Speaker PDF saved: {output_pdf}")
+    log.info(f"PDF saved: {output_pdf}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bot
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run_bot(
-    meeting_id:   str,
-    passcode:     Union[str, None],
-    display_name: str,
-    writer:       ChunkWriter,
-    headless:     bool,
-    max_min:      int,
-    debug_dir:    Union[Path, None],
+    meeting_id:        str,
+    passcode:          Union[str, None],
+    display_name:      str,
+    writer:            ChunkWriter,
+    headless:          bool,
+    max_min:           int,
+    debug_dir:         Union[Path, None],
     manual_stop_check: Union[Callable, None] = None,
 ):
     join_url = build_join_url(meeting_id, passcode)
@@ -519,7 +469,7 @@ async def run_bot(
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
-                "--mute-audio",
+                "--mute-audio",                          # mute speakers so host doesn't hear echo
                 "--use-fake-device-for-media-stream",
             ],
         )
@@ -540,7 +490,6 @@ async def run_bot(
         )
 
         page = await ctx.new_page()
-
         track_count = {"n": 0}
 
         def on_console(msg):
@@ -558,7 +507,7 @@ async def run_bot(
         page.on("console",   on_console)
         page.on("pageerror", lambda e: log.debug(f"  [page error] {e}"))
 
-        log.info("Opening Zoom Web Client …")
+        log.info("Opening Zoom Web Client...")
         try:
             await page.goto(join_url, wait_until="domcontentloaded", timeout=30_000)
         except Exception as e:
@@ -568,54 +517,40 @@ async def run_bot(
 
         await asyncio.sleep(3)
         log.info(f"URL after load: {page.url}")
-        
-        # Debug: print page title and look for any forms
+
         try:
-            title = await page.title()
-            log.info(f"Page title: {title}")
-            
-            # Look for any input fields
+            title  = await page.title()
             inputs = await page.query_selector_all("input")
+            log.info(f"Page title: {title}")
             log.info(f"Found {len(inputs)} input fields")
-            for i, inp in enumerate(inputs[:3]):  # Show first 3
-                placeholder = await inp.get_attribute("placeholder") or "no placeholder"
-                input_type = await inp.get_attribute("type") or "no type"
-                log.info(f"  Input {i+1}: type='{input_type}', placeholder='{placeholder}'")
-            
-            # Look for any buttons
+            for i, inp in enumerate(inputs[:3]):
+                ph  = await inp.get_attribute("placeholder") or "no placeholder"
+                typ = await inp.get_attribute("type") or "no type"
+                log.info(f"  Input {i+1}: type='{typ}', placeholder='{ph}'")
             buttons = await page.query_selector_all("button")
             log.info(f"Found {len(buttons)} buttons")
-            for i, btn in enumerate(buttons[:5]):  # Show first 5
-                text = await btn.text_content() or ""
-                log.info(f"  Button {i+1}: '{text}'")
-                
+            for i, btn in enumerate(buttons[:5]):
+                txt = await btn.text_content() or ""
+                log.info(f"  Button {i+1}: '{txt}'")
         except Exception as e:
             log.warning(f"Debug info failed: {e}")
 
-        if debug_dir:
-            await page.screenshot(path=str(debug_dir / "00_initial.png"))
-
-        # Dismiss consent / cookie banners
+        # Consent banners
         for sel in ['button:has-text("I Agree")', 'button:has-text("Accept")']:
             try:
                 btn = await page.query_selector(sel)
                 if btn:
                     await btn.click()
                     await asyncio.sleep(1)
-                    log.info(f"  Consent dismissed")
                     break
             except Exception:
                 pass
 
-        # Check if already in meeting first
         current_state = await get_state(page)
         log.info(f"Current state: {current_state}")
-        
-        if current_state in ["in_meeting", "audio_dialog"]:
-            log.info("Already in meeting, skipping name input")
-        else:
-            # Enter name
-            log.info(f"Waiting for name input … (will enter '{display_name}')")
+
+        if current_state not in ["in_meeting", "audio_dialog"]:
+            log.info(f"Waiting for name input (will enter '{display_name}')...")
             ns = await wait_state(page, ["name_input"], 20, debug_dir=debug_dir, tag="name")
 
             if ns == "name_input":
@@ -629,15 +564,15 @@ async def run_bot(
                     el = await page.query_selector(sel)
                     if el:
                         await el.click()
-                        await el.fill("")  # Clear any existing content
+                        await el.fill("")
                         await el.type(display_name, delay=80)
                         log.info(f"  Name entered ({sel})")
                         break
 
                 await asyncio.sleep(0.5)
                 for sel in [
-                    "button#joinBtn", 
-                    "button:has-text('Join')", 
+                    "button#joinBtn",
+                    "button:has-text('Join')",
                     "button[type='submit']",
                     "button[aria-label*='Join' i]",
                     ".join-btn",
@@ -650,40 +585,30 @@ async def run_bot(
                         break
                 await asyncio.sleep(2)
             else:
-                log.warning(f"Name field not shown ({ns}) — Zoom may have auto-joined.")
-                if debug_dir:
-                    await page.screenshot(path=str(debug_dir / "no_name.png"))
-                
-                # Fallback: try to find any text input and enter name
-                log.info("Trying fallback approach to find name input...")
+                log.warning(f"Name field not shown ({ns}) — trying fallback...")
                 try:
-                    # Look for any input field
                     inputs = await page.query_selector_all("input[type='text'], input:not([type])")
-                    for input_el in inputs:
-                        placeholder = await input_el.get_attribute("placeholder") or ""
-                        if "name" in placeholder.lower() or "enter" in placeholder.lower() or not placeholder:
-                            await input_el.click()
-                            await input_el.fill("")  # Clear any existing content
-                            await input_el.type(display_name, delay=80)
-                            log.info(f"  Name entered using fallback (placeholder: {placeholder})")
+                    for inp in inputs:
+                        ph = await inp.get_attribute("placeholder") or ""
+                        if "name" in ph.lower() or "enter" in ph.lower() or not ph:
+                            await inp.click()
+                            await inp.fill("")
+                            await inp.type(display_name, delay=80)
+                            log.info(f"  Name entered via fallback")
                             break
-                    
-                    # Look for any join button
                     await asyncio.sleep(0.5)
                     buttons = await page.query_selector_all("button")
                     for btn in buttons:
-                        text = await btn.text_content() or ""
-                        if "join" in text.lower():
+                        txt = await btn.text_content() or ""
+                        if "join" in txt.lower():
                             await btn.click()
-                            log.info(f"  Join clicked using fallback (text: {text})")
+                            log.info(f"  Join clicked via fallback")
                             break
                     await asyncio.sleep(2)
                 except Exception as e:
-                    log.warning(f"Fallback approach failed: {e}")
+                    log.warning(f"Fallback failed: {e}")
 
-        # Passcode
         if await get_state(page) == "passcode_input":
-            log.info("Passcode prompt …")
             if passcode:
                 await page.fill("input#inputpasscode", passcode)
                 await page.click("button:has-text('Join'), button[type='submit']")
@@ -691,26 +616,19 @@ async def run_bot(
             else:
                 log.error("Passcode required but none provided!")
 
-        # Wait for admission
-        log.info("Waiting for admission / meeting start …")
+        log.info("Waiting for admission...")
         s = await wait_state(
             page,
             ["waiting_room", "audio_dialog", "in_meeting", "meeting_ended"],
-            timeout_sec=max_min * 60,
-            poll=3,
-            debug_dir=debug_dir,
-            tag="admission",
+            timeout_sec=max_min * 60, poll=3, debug_dir=debug_dir, tag="admission",
         )
 
         if s == "waiting_room":
-            log.info("In waiting room …")
+            log.info("In waiting room...")
             s = await wait_state(
                 page,
                 ["audio_dialog", "in_meeting", "meeting_ended"],
-                timeout_sec=max_min * 60,
-                poll=5,
-                debug_dir=debug_dir,
-                tag="waiting_room",
+                timeout_sec=max_min * 60, poll=5, debug_dir=debug_dir, tag="waiting_room",
             )
 
         if s in ("timeout", "error", "meeting_ended"):
@@ -718,8 +636,7 @@ async def run_bot(
             await browser.close()
             return
 
-        # Join computer audio
-        log.info("Joining with computer audio …")
+        log.info("Joining with computer audio...")
         for _ in range(3):
             try:
                 for sel in [
@@ -735,56 +652,32 @@ async def run_bot(
                         log.info(f"  Audio clicked ({sel})")
                         await asyncio.sleep(1.5)
                         break
-                for sel in [
-                    "button:has-text('Join with Computer Audio')",
-                    "button:has-text('Computer Audio')",
-                ]:
-                    btn = await page.query_selector(sel)
-                    if btn:
-                        await btn.click()
-                        await asyncio.sleep(1)
-                        break
                 break
             except Exception as e:
                 log.warning(f"  Audio join error: {e}")
                 await asyncio.sleep(2)
 
-        if debug_dir:
-            await page.screenshot(path=str(debug_dir / "after_audio_join.png"))
-
-        # Confirm in meeting
         s = await wait_state(page, ["in_meeting", "meeting_ended"], 20, debug_dir=debug_dir)
-        log.info(f"  In-meeting state: {s!r}")
+        log.info(f"In-meeting state: {s!r}")
 
-        # Wait for first track
-        log.info("Waiting for audio tracks to connect (up to 30s) …")
+        log.info("Waiting for audio tracks (up to 30s)...")
         track_deadline = time.time() + 30
         while time.time() < track_deadline:
             if track_count["n"] > 0:
-                log.info(f"  Got {track_count['n']} audio track(s) — recording active.")
+                log.info(f"Got {track_count['n']} audio track(s) — recording active.")
                 break
             await asyncio.sleep(1)
         else:
-            log.warning(
-                "No audio tracks captured after 30s.\n"
-                "  Possible causes:\n"
-                "  1. Meeting has no active speakers (everyone muted).\n"
-                "  2. Zoom routed audio differently — check --debug screenshots.\n"
-                "  3. The meeting host hasn't started yet.\n"
-                "  Recording will continue — tracks may connect later."
-            )
+            log.warning("No audio tracks after 30s — recording continues, tracks may connect later.")
 
-        log.info(f"Recording in progress … (Ctrl-C to stop, max {max_min} min)")
-        deadline = time.time() + max_min * 60
-        last_log = time.time()
+        log.info(f"Recording in progress (max {max_min} min)...")
+        deadline  = time.time() + max_min * 60
+        last_log  = time.time()
 
-        # Main wait loop
         while time.time() < deadline:
-            # Check for manual stop request
             if manual_stop_check and manual_stop_check():
-                log.info("🛑 Manual stop request received, finishing recording...")
+                log.info("Manual stop received — finishing recording...")
                 break
-                
             s = await get_state(page)
             if s == "meeting_ended":
                 log.info("Meeting ended signal detected.")
@@ -794,126 +687,87 @@ async def run_bot(
                 break
             if time.time() - last_log >= 60:
                 log.info(
-                    f"  Still recording … "
-                    f"{writer.duration_est/60:.1f} min, "
-                    f"{writer.bytes/1_048_576:.1f} MB, "
-                    f"{track_count['n']} track(s)"
+                    f"Still recording: {writer.duration_est/60:.1f} min, "
+                    f"{writer.bytes/1_048_576:.1f} MB, {track_count['n']} track(s)"
                 )
                 last_log = time.time()
             await asyncio.sleep(5)
         else:
-            log.warning(f"Max wait ({max_min} min) reached.")
+            log.warning(f"Max recording time ({max_min} min) reached.")
 
-        # Stop
-        log.info("Stopping recorder …")
+        # ── Stop recorder BEFORE navigating away so no leave-chime is recorded ──
+        log.info("Stopping recorder...")
         try:
             r = await page.evaluate(STOP_JS)
-            log.info(f"  Recorder: {r}")
+            log.info(f"  Recorder stop result: {r}")
+            # Give the recorder 1.5s to flush its last chunk
             await asyncio.sleep(1.5)
         except Exception as e:
             log.warning(f"  Stop error: {e}")
 
-        if debug_dir:
-            try:
-                await page.screenshot(path=str(debug_dir / "final.png"))
-            except Exception:
-                pass
+        # Navigate away AFTER stopping — this prevents the Zoom leave-chime
+        # from being captured in the final chunks
+        try:
+            await page.goto("about:blank", timeout=5_000)
+        except Exception:
+            pass
 
         await browser.close()
-        log.info("Done.")
+        log.info("Browser closed.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main workflow
+# Main recording → PDF workflow
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_recording_to_pdf(webm_path: Path, output_dir: Path, meeting_id: str) -> Path:
-    """Process recorded audio to transcript PDF"""
-    log.info("🔄 Starting transcription process...")
-    
-    # Convert to MP3 for better compatibility
-    mp3_path = to_mp3(webm_path)
-    if not mp3_path:
-        log.error("Failed to convert to MP3, using original WebM file")
-        mp3_path = webm_path
-    
-    try:
-        # Upload to AssemblyAI
-        audio_url = upload_audio_file(mp3_path)
-        
-        # Transcribe with speaker labels
-        result = transcribe_audio(audio_url)
-        
-        # Generate PDF filename
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        pdf_path = output_dir / f"zoom_transcript_{meeting_id}_{timestamp}.pdf"
-        
-        # Save as PDF
-        save_transcript_as_pdf(result, str(pdf_path))
-        
-        return pdf_path
-        
-    except Exception as e:
-        log.error(f"Transcription failed: {e}")
-        raise
+    log.info("Starting transcription process...")
 
-def _finish(writer: ChunkWriter, args: argparse.Namespace):
+    # Try MP3 conversion first (better AssemblyAI compatibility)
+    audio_path = to_mp3(webm_path)
+    if audio_path is None:
+        log.info("Using original WebM for upload (ffmpeg not available or failed)")
+        audio_path = webm_path
+
+    if not audio_path.exists() or audio_path.stat().st_size < 512:
+        raise RuntimeError(f"Audio file missing or too small: {audio_path}")
+
+    audio_url = upload_audio_file(audio_path)
+    result    = transcribe_audio(audio_url)
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    pdf_path  = output_dir / f"zoom_transcript_{meeting_id}_{timestamp}.pdf"
+    save_transcript_as_pdf(result, str(pdf_path))
+
+    return pdf_path
+
+
+def _finish(writer, args):
     webm = writer.close()
-
     if not webm.exists() or webm.stat().st_size < 512:
-        log.error(
-            f"Output file missing or too small ({webm.stat().st_size if webm.exists() else 0} bytes).\n"
-            "  → Run with --no-headless --debug to see what happened.\n"
-            "  → Check that someone was actually speaking in the meeting."
-        )
+        log.error("Output file missing or too small.")
         return
-
-    outputs = [str(webm)]
-
-    if not args.no_wav:
-        w = to_wav(webm)
-        if w:
-            outputs.append(str(w))
-        elif not shutil.which("ffmpeg"):
-            log.info("  (install ffmpeg to get .wav/.mp3 output)")
-
-    if not args.no_mp3:
-        m = to_mp3(webm)
-        if m:
-            outputs.append(str(m))
-
-    print("\n✓ Recording complete:")
-    for o in outputs:
-        print(f"  {o}")
-
-    # Process to PDF if transcription is enabled
     if not args.no_transcript:
         try:
-            output_dir = Path(args.out)
-            pdf_path = process_recording_to_pdf(webm, output_dir, args.meeting_id)
-            print(f"\n🎉 Transcript PDF created: {pdf_path}")
+            pdf = process_recording_to_pdf(webm, Path(args.out), args.meeting_id)
+            print(f"\n🎉 Transcript PDF: {pdf}")
         except Exception as e:
             log.error(f"Failed to create transcript: {e}")
 
+
 def main():
-    p = argparse.ArgumentParser(
-        description="Record Zoom meeting audio and transcribe to PDF.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    p.add_argument("zoom_link",     nargs="?",             help="Zoom invite URL")
-    p.add_argument("--name",        default="Recorder",    help="Display name in meeting")
-    p.add_argument("--out",         default="./recordings",help="Output directory")
-    p.add_argument("--no-headless", action="store_true",   help="Show the browser window")
-    p.add_argument("--max-wait",    type=int, default=180, help="Max minutes to record (default 180)")
-    p.add_argument("--no-mp3",      action="store_true",   help="Skip mp3 conversion")
-    p.add_argument("--no-wav",      action="store_true",   help="Skip wav conversion")
-    p.add_argument("--no-transcript", action="store_true", help="Skip PDF transcription")
-    p.add_argument("--debug",       action="store_true",   help="Save screenshots at each step")
+    p = argparse.ArgumentParser(description="Record Zoom meeting audio and transcribe to PDF.")
+    p.add_argument("zoom_link",       nargs="?")
+    p.add_argument("--name",          default="Recorder")
+    p.add_argument("--out",           default="./recordings")
+    p.add_argument("--no-headless",   action="store_true")
+    p.add_argument("--max-wait",      type=int, default=180)
+    p.add_argument("--no-mp3",        action="store_true")
+    p.add_argument("--no-transcript", action="store_true")
+    p.add_argument("--debug",         action="store_true")
     args = p.parse_args()
 
-    # Check for API key
     if not args.no_transcript and not os.getenv("API_KEY"):
-        sys.exit("❌ API_KEY not found in environment variables. Set it in .env file or export it.")
+        sys.exit("API_KEY not found. Set it in your .env file.")
 
     if not args.zoom_link:
         args.zoom_link = input("Zoom link: ").strip()
@@ -926,23 +780,17 @@ def main():
     except ValueError as e:
         sys.exit(f"Error: {e}")
 
-    log.info(f"Meeting : {meeting_id}")
-    log.info(f"Passcode: {'(none)' if not passcode else '***'}")
-
     ts        = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out_dir   = Path(args.out)
     webm_path = out_dir / f"zoom_{meeting_id}_{ts}.webm"
     debug_dir = (out_dir / f"debug_{ts}") if args.debug else None
     if debug_dir:
         debug_dir.mkdir(parents=True, exist_ok=True)
-        log.info(f"Debug dir: {debug_dir}")
-
-    log.info(f"Output  : {webm_path}")
 
     writer = ChunkWriter(webm_path)
 
     def _sigint(sig, frame):
-        log.info("\nCtrl-C — saving …")
+        log.info("Ctrl-C — saving...")
         _finish(writer, args)
         sys.exit(0)
 
@@ -962,6 +810,7 @@ def main():
         log.error(f"Fatal: {e}", exc_info=True)
 
     _finish(writer, args)
+
 
 if __name__ == "__main__":
     main()
