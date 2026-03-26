@@ -686,7 +686,7 @@ async def run_bot(
                     log.warning("  No Join element found — pressing Enter as last resort")
                     await page.keyboard.press("Enter")
 
-                # ── Step 5: Wait and retry once if still stuck ────────────────
+                # ── Step 5: Wait for join to complete and handle next state ────────
                 await asyncio.sleep(5)
                 recheck = await get_state(page)
                 log.info(f"  State after join attempt: {recheck!r}")
@@ -695,6 +695,8 @@ async def run_bot(
                     log.warning("  Still on name_input — second join attempt...")
                     await try_click_join()
                     await asyncio.sleep(5)
+                    recheck = await get_state(page)
+                    log.info(f"  State after second join attempt: {recheck!r}")
                 elif recheck == "joining":
                     log.info("  Joining in progress — waiting for transition...")
                     # Wait for joining to complete (can take 10-15 seconds)
@@ -712,6 +714,7 @@ async def run_bot(
                         join_result = await get_state(page)
                         if join_result in ["audio_dialog", "in_meeting", "waiting_room"]:
                             log.info(f"  Join completed: {join_result!r}")
+                            recheck = join_result
                             break
                         await asyncio.sleep(1)
                     else:
@@ -722,37 +725,12 @@ async def run_bot(
                             return
                         await page.reload(wait_until="domcontentloaded")
                         await asyncio.sleep(3)
-
-            else:
-                log.info(f"  Join successful - moved to state: {recheck!r}")
-                # Add a small delay to let the page settle after joining
-                await asyncio.sleep(2)
-                try:
-                    inputs = await page.query_selector_all("input[type='text'], input:not([type])")
-                    for inp in inputs:
-                        ph = await inp.get_attribute("placeholder") or ""
-                        if "name" in ph.lower() or "enter" in ph.lower() or not ph:
-                            await inp.click()
-                            await inp.press("Control+a")
-                            await inp.press("Backspace")
-                            await asyncio.sleep(0.3)
-                            await inp.type(display_name, delay=80)
-                            log.info(f"  Name entered via fallback")
-                            break
-                    await asyncio.sleep(1)
-                    # Try both button and div-based join elements in fallback too
-                    for sel in [
-                        "button:has-text('Join')", "button[type='submit']",
-                        "[role='button']:has-text('Join')", "div:has-text('Join Meeting')",
-                    ]:
-                        btn = await page.query_selector(sel)
-                        if btn:
-                            await btn.click()
-                            log.info(f"  Join clicked via fallback ({sel})")
-                            break
-                    await asyncio.sleep(5)
-                except Exception as e:
-                    log.warning(f"Fallback failed: {e}")
+                        recheck = await get_state(page)
+                        log.info(f"  State after refresh: {recheck!r}")
+                else:
+                    log.info(f"  Join successful - moved to state: {recheck!r}")
+                    # Add a small delay to let the page settle after joining
+                    await asyncio.sleep(2)
 
         if await get_state(page) == "passcode_input":
             if passcode:
