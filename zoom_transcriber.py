@@ -77,14 +77,9 @@ INIT_SCRIPT = r"""
     }
 
     // ── Aggressively suppress ALL notification / beep sounds ─────────────────
-    // Strategy: intercept createOscillator and createBufferSource at the
-    // AudioContext level. Any short buffer (<3s) or oscillator that is NOT
-    // connected to our ZR.dest gets its gain zeroed before it reaches output.
-
     const _createOscillator = AudioContext.prototype.createOscillator;
     AudioContext.prototype.createOscillator = function() {
         const osc = _createOscillator.apply(this, arguments);
-        // Zero out frequency so it produces silence
         try { osc.frequency.value = 0; } catch(_) {}
         return osc;
     };
@@ -94,7 +89,6 @@ INIT_SCRIPT = r"""
         const src = _createBufferSource.apply(this, arguments);
         const origStart = src.start.bind(src);
         src.start = function(when, offset, duration) {
-            // Block any short sound effect (beeps, chimes, notifications)
             if (src.buffer && src.buffer.duration < 3.0) {
                 try { src.disconnect(); } catch(_) {}
                 console.log('ZOOM_REC::beep_suppressed duration=' + (src.buffer ? src.buffer.duration.toFixed(3) : 'unknown'));
@@ -105,15 +99,11 @@ INIT_SCRIPT = r"""
         return src;
     };
 
-    // Also patch GainNode to catch Zoom routing beeps through gain stages
     const _createGain = AudioContext.prototype.createGain;
     AudioContext.prototype.createGain = function() {
         const gain = _createGain.apply(this, arguments);
-        // Watch for very short gain envelopes (notification sounds)
         const origConnect = gain.connect.bind(gain);
         gain.connect = function(target) {
-            // If this gain node is connected to destination (speakers) but NOT
-            // our ZR.dest, it's a notification — mute it
             if (target && target === this.context && target === this.context.destination) {
                 gain.gain.value = 0;
             }
@@ -191,8 +181,6 @@ INIT_SCRIPT = r"""
 })();
 """
 
-# Stop the MediaRecorder cleanly, THEN navigate away so Zoom's
-# leave-meeting chime never fires into our recording
 STOP_JS = """
 (function(){
     const r = window.__ZR && window.__ZR.recorder;
@@ -327,13 +315,30 @@ def _run_ffmpeg(args: List[str]) -> bool:
 
 def to_mp3(src: Path, bitrate: str = "128k") -> Union[Path, None]:
     out = src.with_suffix(".mp3")
-    # -vn = no video, just audio stream
     ok = _run_ffmpeg(["-i", str(src), "-vn", "-codec:a", "libmp3lame", "-b:a", bitrate, str(out)])
     if ok and out.exists() and out.stat().st_size > 0:
         log.info(f"MP3: {out}  ({out.stat().st_size/1_048_576:.1f} MB)")
         return out
     log.warning("MP3 conversion failed or produced empty file — will upload webm directly")
     return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 1: Validate audio has real content before transcription
+# ─────────────────────────────────────────────────────────────────────────────
+
+MIN_AUDIO_SIZE_BYTES = 512 * 1024  # 512 KB — anything smaller is likely silence
+
+def validate_audio(path: Path):
+    """Raise RuntimeError if the audio file is too small to contain real speech."""
+    if not path.exists():
+        raise RuntimeError(f"Audio file does not exist: {path}")
+    size = path.stat().st_size
+    if size < MIN_AUDIO_SIZE_BYTES:
+        raise RuntimeError(
+            f"Audio file is only {size / 1024:.1f} KB — likely silence or failed recording. "
+            f"The bot may not have successfully joined the meeting."
+        )
+    log.info(f"Audio size OK: {size / 1_048_576:.2f} MB")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Transcription
@@ -346,7 +351,7 @@ def upload_audio_file(file_path):
         response = requests.post(
             base_url + "/upload",
             headers=headers,
-            data=f,                          # stream upload — avoids loading entire file into RAM
+            data=f,
             timeout=300,
         )
     if response.status_code == 200:
@@ -358,13 +363,18 @@ def upload_audio_file(file_path):
 
 def transcribe_audio(audio_url):
     headers = {"authorization": os.getenv("API_KEY"), "content-type": "application/json"}
+
+    # FIX 2: Disable language_detection and hardcode English to prevent
+    # "language_detection cannot be performed on files with no spoken audio" error.
+    # If you record non-English meetings, set language_code accordingly.
     data = {
-        "audio_url": audio_url,
-        "speech_model": "universal",         # NOTE: singular "speech_model", not "speech_models"
-        "language_detection": True,
-        "punctuate": True,
-        "format_text": True,
-        "speaker_labels": True,
+        "audio_url":          audio_url,
+        "speech_model":       "universal",
+        "language_code":      "en",    # ← hardcoded; avoids auto-detect on near-silent files
+        "language_detection": False,   # ← disabled; was causing failures on short/silent audio
+        "punctuate":          True,
+        "format_text":        True,
+        "speaker_labels":     True,
     }
 
     log.info("Submitting transcription request...")
@@ -432,7 +442,6 @@ def save_transcript_as_pdf(result, output_pdf="meeting_transcript.pdf"):
     for para in text.split('\n\n'):
         para = para.strip()
         if para:
-            # Sanitise for ReportLab
             para = ''.join(c for c in para if c.isprintable() or c in '\n\t')
             para = para.replace('\x00', '').replace('\ufffd', '')
             story.append(Paragraph(para, content_style))
@@ -469,7 +478,7 @@ async def run_bot(
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
-                "--mute-audio",                          # mute speakers so host doesn't hear echo
+                "--mute-audio",
                 "--use-fake-device-for-media-stream",
             ],
         )
@@ -554,36 +563,67 @@ async def run_bot(
             ns = await wait_state(page, ["name_input"], 20, debug_dir=debug_dir, tag="name")
 
             if ns == "name_input":
+                # FIX 3: Expanded selector list + clear field before typing
+                name_entered = False
                 for sel in [
                     "input#inputname",
                     "input[placeholder*='Your Name' i]",
-                    "input[placeholder*='name' i]",
                     "input[placeholder*='Enter your name' i]",
+                    "input[placeholder*='name' i]",
                     "input[type='text']",
                 ]:
                     el = await page.query_selector(sel)
                     if el:
                         await el.click()
-                        await el.fill("")
+                        await el.triple_click()           # select all existing text
+                        await el.fill("")                 # clear field explicitly
+                        await asyncio.sleep(0.3)
                         await el.type(display_name, delay=80)
                         log.info(f"  Name entered ({sel})")
+                        name_entered = True
                         break
 
+                if not name_entered:
+                    log.warning("  Could not find name input field via any selector")
+
                 await asyncio.sleep(0.5)
+
+                # FIX 4: Try more join button selectors; "Join Meeting" first (most specific)
+                join_clicked = False
                 for sel in [
+                    "button:has-text('Join Meeting')",
                     "button#joinBtn",
                     "button:has-text('Join')",
                     "button[type='submit']",
                     "button[aria-label*='Join' i]",
                     ".join-btn",
-                    "button:has-text('Join Meeting')",
                 ]:
                     btn = await page.query_selector(sel)
                     if btn:
                         await btn.click()
                         log.info(f"  Join clicked ({sel})")
+                        join_clicked = True
                         break
-                await asyncio.sleep(2)
+
+                if not join_clicked:
+                    log.warning("  Could not find Join button — trying Enter key")
+                    await page.keyboard.press("Enter")
+
+                # FIX 5: Increased post-join wait from 2s → 5s to give Zoom time to process
+                await asyncio.sleep(5)
+
+                # FIX 6: If we land back on name_input (state didn't advance), retry once
+                recheck = await get_state(page)
+                if recheck == "name_input":
+                    log.warning("  Still on name_input after join — retrying click...")
+                    for sel in ["button:has-text('Join')", "button[type='submit']", "button#joinBtn"]:
+                        btn = await page.query_selector(sel)
+                        if btn:
+                            await btn.click()
+                            log.info(f"  Join retry clicked ({sel})")
+                            break
+                    await asyncio.sleep(5)
+
             else:
                 log.warning(f"Name field not shown ({ns}) — trying fallback...")
                 try:
@@ -592,7 +632,9 @@ async def run_bot(
                         ph = await inp.get_attribute("placeholder") or ""
                         if "name" in ph.lower() or "enter" in ph.lower() or not ph:
                             await inp.click()
+                            await inp.triple_click()
                             await inp.fill("")
+                            await asyncio.sleep(0.3)
                             await inp.type(display_name, delay=80)
                             log.info(f"  Name entered via fallback")
                             break
@@ -604,7 +646,8 @@ async def run_bot(
                             await btn.click()
                             log.info(f"  Join clicked via fallback")
                             break
-                    await asyncio.sleep(2)
+                    # FIX 7: Also increased fallback wait
+                    await asyncio.sleep(5)
                 except Exception as e:
                     log.warning(f"Fallback failed: {e}")
 
@@ -695,18 +738,14 @@ async def run_bot(
         else:
             log.warning(f"Max recording time ({max_min} min) reached.")
 
-        # ── Stop recorder BEFORE navigating away so no leave-chime is recorded ──
         log.info("Stopping recorder...")
         try:
             r = await page.evaluate(STOP_JS)
             log.info(f"  Recorder stop result: {r}")
-            # Give the recorder 1.5s to flush its last chunk
             await asyncio.sleep(1.5)
         except Exception as e:
             log.warning(f"  Stop error: {e}")
 
-        # Navigate away AFTER stopping — this prevents the Zoom leave-chime
-        # from being captured in the final chunks
         try:
             await page.goto("about:blank", timeout=5_000)
         except Exception:
@@ -722,14 +761,13 @@ async def run_bot(
 def process_recording_to_pdf(webm_path: Path, output_dir: Path, meeting_id: str) -> Path:
     log.info("Starting transcription process...")
 
-    # Try MP3 conversion first (better AssemblyAI compatibility)
     audio_path = to_mp3(webm_path)
     if audio_path is None:
         log.info("Using original WebM for upload (ffmpeg not available or failed)")
         audio_path = webm_path
 
-    if not audio_path.exists() or audio_path.stat().st_size < 512:
-        raise RuntimeError(f"Audio file missing or too small: {audio_path}")
+    # FIX 8: Validate audio size BEFORE uploading to prevent AssemblyAI silent-file errors
+    validate_audio(audio_path)
 
     audio_url = upload_audio_file(audio_path)
     result    = transcribe_audio(audio_url)
