@@ -563,19 +563,43 @@ async def run_bot(
             ns = await wait_state(page, ["name_input"], 20, debug_dir=debug_dir, tag="name")
 
             if ns == "name_input":
-                # FIX 3: Expanded selector list + clear field before typing
+                # ── Step 1: Wait for input to be truly ready ──────────────────
+                await asyncio.sleep(2)
+
+                # ── Step 2: Dump all clickable elements for one-time diagnosis ─
+                try:
+                    all_btns = await page.query_selector_all("button, [role='button'], [class*='btn'], [class*='join']")
+                    log.info(f"  Found {len(all_btns)} clickable element(s) on page:")
+                    for i, b in enumerate(all_btns[:10]):
+                        txt  = (await b.text_content() or "").strip()
+                        cls  = (await b.get_attribute("class") or "")[:60]
+                        role = (await b.get_attribute("role") or "")
+                        eid  = (await b.get_attribute("id") or "")
+                        log.info(f"    [{i}] tag=? id={eid!r} role={role!r} class={cls!r} text={txt!r}")
+                    all_inputs = await page.query_selector_all("input")
+                    log.info(f"  Found {len(all_inputs)} input(s):")
+                    for i, inp in enumerate(all_inputs[:5]):
+                        typ = (await inp.get_attribute("type") or "")
+                        ph  = (await inp.get_attribute("placeholder") or "")
+                        eid = (await inp.get_attribute("id") or "")
+                        log.info(f"    [{i}] type={typ!r} id={eid!r} placeholder={ph!r}")
+                except Exception as de:
+                    log.warning(f"  DOM dump failed: {de}")
+
+                # ── Step 3: Enter display name ────────────────────────────────
                 name_entered = False
-                for sel in [
+                name_selectors = [
                     "input#inputname",
                     "input[placeholder*='Your Name' i]",
                     "input[placeholder*='Enter your name' i]",
                     "input[placeholder*='name' i]",
                     "input[type='text']",
-                ]:
+                    "input:not([type='hidden'])",
+                ]
+                for sel in name_selectors:
                     el = await page.query_selector(sel)
                     if el:
                         await el.click()
-                        # Select all existing text and clear it (ElementHandle compatible)
                         await el.press("Control+a")
                         await el.press("Backspace")
                         await asyncio.sleep(0.3)
@@ -585,44 +609,89 @@ async def run_bot(
                         break
 
                 if not name_entered:
-                    log.warning("  Could not find name input field via any selector")
+                    log.warning("  Could not find name input via any selector — trying JS inject")
+                    try:
+                        await page.evaluate(f"""
+                            const inp = document.querySelector('input');
+                            if (inp) {{
+                                inp.value = '';
+                                inp.focus();
+                                document.execCommand('selectAll');
+                                document.execCommand('insertText', false, '{display_name}');
+                            }}
+                        """)
+                        log.info("  Name injected via JS execCommand")
+                        name_entered = True
+                    except Exception as je:
+                        log.warning(f"  JS name inject failed: {je}")
 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1)
 
-                # FIX 4: Try more join button selectors; "Join Meeting" first (most specific)
-                join_clicked = False
-                for sel in [
-                    "button:has-text('Join Meeting')",
-                    "button#joinBtn",
-                    "button:has-text('Join')",
-                    "button[type='submit']",
-                    "button[aria-label*='Join' i]",
-                    ".join-btn",
-                ]:
-                    btn = await page.query_selector(sel)
-                    if btn:
-                        await btn.click()
-                        log.info(f"  Join clicked ({sel})")
-                        join_clicked = True
-                        break
+                # ── Step 4: Click Join — buttons AND div/role="button" elements ─
+                async def try_click_join() -> bool:
+                    # 4a: standard <button> selectors
+                    for sel in [
+                        "button#joinBtn",
+                        "button[type='submit']",
+                        "button:has-text('Join')",
+                        "button:has-text('Join Meeting')",
+                        "button[aria-label*='Join' i]",
+                    ]:
+                        try:
+                            el = await page.query_selector(sel)
+                            if el:
+                                await el.click()
+                                log.info(f"  Join clicked via button selector ({sel})")
+                                return True
+                        except Exception:
+                            pass
+
+                    # 4b: div / span / any element acting as a button (Zoom often does this)
+                    for sel in [
+                        "[role='button']:has-text('Join')",
+                        "div:has-text('Join Meeting')",
+                        "[class*='join-btn']",
+                        "[class*='joinBtn']",
+                        "[class*='join_btn']",
+                        "[id*='join']",
+                    ]:
+                        try:
+                            el = await page.query_selector(sel)
+                            if el:
+                                await el.click()
+                                log.info(f"  Join clicked via role/div selector ({sel})")
+                                return True
+                        except Exception:
+                            pass
+
+                    # 4c: scan ALL elements whose text contains "join"
+                    try:
+                        candidates = await page.query_selector_all("button, [role='button'], div, span, a")
+                        for el in candidates:
+                            txt = (await el.text_content() or "").strip().lower()
+                            if txt in ("join", "join meeting", "join now"):
+                                await el.click()
+                                log.info(f"  Join clicked via text scan: {txt!r}")
+                                return True
+                    except Exception as se:
+                        log.warning(f"  Text scan failed: {se}")
+
+                    return False
+
+                join_clicked = await try_click_join()
 
                 if not join_clicked:
-                    log.warning("  Could not find Join button — trying Enter key")
+                    log.warning("  No Join element found — pressing Enter as last resort")
                     await page.keyboard.press("Enter")
 
-                # FIX 5: Increased post-join wait from 2s → 5s to give Zoom time to process
+                # ── Step 5: Wait and retry once if still stuck ────────────────
                 await asyncio.sleep(5)
-
-                # FIX 6: If we land back on name_input (state didn't advance), retry once
                 recheck = await get_state(page)
+                log.info(f"  State after join attempt: {recheck!r}")
+
                 if recheck == "name_input":
-                    log.warning("  Still on name_input after join — retrying click...")
-                    for sel in ["button:has-text('Join')", "button[type='submit']", "button#joinBtn"]:
-                        btn = await page.query_selector(sel)
-                        if btn:
-                            await btn.click()
-                            log.info(f"  Join retry clicked ({sel})")
-                            break
+                    log.warning("  Still on name_input — second join attempt...")
+                    await try_click_join()
                     await asyncio.sleep(5)
 
             else:
@@ -639,15 +708,17 @@ async def run_bot(
                             await inp.type(display_name, delay=80)
                             log.info(f"  Name entered via fallback")
                             break
-                    await asyncio.sleep(0.5)
-                    buttons = await page.query_selector_all("button")
-                    for btn in buttons:
-                        txt = await btn.text_content() or ""
-                        if "join" in txt.lower():
+                    await asyncio.sleep(1)
+                    # Try both button and div-based join elements in fallback too
+                    for sel in [
+                        "button:has-text('Join')", "button[type='submit']",
+                        "[role='button']:has-text('Join')", "div:has-text('Join Meeting')",
+                    ]:
+                        btn = await page.query_selector(sel)
+                        if btn:
                             await btn.click()
-                            log.info(f"  Join clicked via fallback")
+                            log.info(f"  Join clicked via fallback ({sel})")
                             break
-                    # FIX 7: Also increased fallback wait
                     await asyncio.sleep(5)
                 except Exception as e:
                     log.warning(f"Fallback failed: {e}")
