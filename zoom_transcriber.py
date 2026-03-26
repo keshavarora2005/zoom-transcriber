@@ -801,6 +801,7 @@ async def run_bot(
         last_log  = time.time()
 
         while time.time() < deadline:
+            # Check manual stop more frequently (every 1 second instead of 5)
             if manual_stop_check and manual_stop_check():
                 log.info("Manual stop received — finishing recording...")
                 break
@@ -817,7 +818,8 @@ async def run_bot(
                     f"{writer.bytes/1_048_576:.1f} MB, {track_count['n']} track(s)"
                 )
                 last_log = time.time()
-            await asyncio.sleep(5)
+            # Reduced sleep time for faster stop response
+            await asyncio.sleep(1)
         else:
             log.warning(f"Max recording time ({max_min} min) reached.")
 
