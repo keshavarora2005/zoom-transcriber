@@ -1,15 +1,14 @@
 services:
   - type: web
     name: zoom-transcriber
-    runtime: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
-    startCommand: python main.py
+    runtime: docker           # ← Docker runs as root during build, so apt-get works
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: API_KEY
-        sync: false          # You'll paste this manually in Render dashboard
-      - key: PORT
-        generateValue: false # Render injects this automatically
+        sync: false           # Paste your AssemblyAI key in Render dashboard
+      - key: RECORDINGS_DIR
+        value: /app/recordings
     disk:
       name: recordings
       mountPath: /app/recordings
-      sizeGB: 10             # Persistent disk so recordings survive restarts
+      sizeGB: 10
