@@ -370,7 +370,7 @@ def transcribe_audio(audio_url):
     # If you record non-English meetings, set language_code accordingly.
     data = {
         "audio_url":          audio_url,
-        "speech_model":       "universal",
+        "speech_models":      ["universal"],
         "language_code":      "en",    # ← hardcoded; avoids auto-detect on near-silent files
         "language_detection": False,   # ← disabled; was causing failures on short/silent audio
         "punctuate":          True,

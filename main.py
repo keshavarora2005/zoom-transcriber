@@ -148,8 +148,8 @@ async def run_job(job_id: str, req: StartRequest):
         webm = writer.close()
         log_job(f"💾 Recording saved: {webm.name} ({webm.stat().st_size / 1_048_576:.1f} MB)")
 
-        # FIX 2: Stronger size guard — 512 KB minimum (not 512 bytes)
-        MIN_SIZE_BYTES = 512 * 1024
+        # FIX 2: Reduced size guard — allow shorter recordings (50KB minimum)
+        MIN_SIZE_BYTES = 50 * 1024
         if not webm.exists() or webm.stat().st_size < MIN_SIZE_BYTES:
             raise RuntimeError(
                 f"Recording is only {webm.stat().st_size / 1024:.1f} KB — "
