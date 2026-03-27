@@ -6,4 +6,5 @@ reportlab
 python-dotenv
 pydantic
 jinja2
+python-multipart
 aiofiles
